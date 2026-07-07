@@ -114,7 +114,7 @@ import { queryCheckpoint } from './utils/queryProfiler.js'
 import { runTools } from './services/tools/toolOrchestration.js'
 import { applyToolResultBudget } from './utils/toolResultStorage.js'
 import { resolveNextFallbackProviderFromState } from './utils/providerFallback.js'
-import { setActiveProviderProfile } from './utils/providerProfiles.js'
+import { setActiveProviderProfile, getActiveProviderProfile } from './utils/providerProfiles.js'
 import { getPrimaryModel } from './utils/providerModels.js'
 import { recordContentReplacement } from './utils/sessionStorage.js'
 import { handleStopHooks } from './query/stopHooks.js'
@@ -135,7 +135,20 @@ import {
   getCurrentTurnTokenBudget,
   getTurnOutputTokens,
   incrementBudgetContinuationCount,
+  getSessionId,
 } from './bootstrap/state.js'
+import { stripThinkingBlocksIfProviderAllows } from './utils/conversationRecovery.js'
+import {
+  decideTurnModel,
+  deriveUserTurnNumber,
+  extractLatestUserText,
+  isRetryableRoutedModelError,
+  latestUserMessageHasNonTextContent,
+  recordRoutingDecision,
+  recordRoutingEscalation,
+  shouldDropPinForProviderSwap,
+  type TurnRoutingDecision,
+} from './services/api/smartRouting/index.js'
 import { createBudgetTracker, checkTokenBudget } from './query/tokenBudget.js'
 import { count } from './utils/array.js'
 /* eslint-disable @typescript-eslint/no-require-imports */
@@ -555,6 +568,16 @@ async function* queryLoop(
   // trigger point. Loop-local (not on State) to avoid touching the 7 continue
   // sites.
   let taskBudgetRemaining: number | undefined = undefined
+  // Smart-routing decision, pinned once per user turn (transition===undefined)
+  // and reused on every continuation pass. Loop-local (not on State) so it
+  // survives the State rebuilds at the continue sites for free — mirrors
+  // taskBudgetRemaining above.
+  let pinnedTurnRoute: TurnRoutingDecision | undefined = undefined
+  // Provider profile the pinned route's model was resolved against. If a
+  // mid-turn provider-fallback swap changes the active provider, the pinned
+  // model (a model-only route keyed to the old provider) must not be replayed
+  // at the new endpoint — KTD6 in the plan.
+  let pinnedRouteProviderId: string | undefined = undefined
   const toolFailureGuardState = createToolFailureLoopGuardState()
 
   // Snapshot immutable env/statsig/session state once at entry. See QueryConfig
@@ -979,6 +1002,62 @@ async function* queryLoop(
         doesMostRecentAssistantMessageExceed200k(messagesForQuery),
     })
 
+    // Smart routing (opt-in): classify once per user turn (transition===undefined)
+    // and pin the decision; reuse the pin on every continuation pass. Applied
+    // BEFORE the blocking-limit math below so the token-budget guard and the
+    // model call agree on the model. Disabled/misconfigured → pin is `routed:false`
+    // and currentModel keeps today's resolution (byte-for-byte unchanged).
+    if (state.transition === undefined) {
+      pinnedTurnRoute = decideTurnModel({
+        settings: appState.settings as unknown as Parameters<typeof decideTurnModel>[0]['settings'],
+        parentModel: currentModel,
+        permissionMode,
+        input: {
+          userText: extractLatestUserText(messagesForQuery),
+          hasNonTextContent: latestUserMessageHasNonTextContent(messagesForQuery),
+          turnNumber: deriveUserTurnNumber(messagesForQuery),
+        },
+        sessionId: getSessionId(),
+      })
+      if (pinnedTurnRoute.routed === false && pinnedTurnRoute.justDisabledForSession) {
+        yield createSystemMessage(
+          'Smart routing disabled for this session: both configured models are outside the org allowlist. Using the default model.',
+          'warning',
+        )
+      }
+      if (pinnedTurnRoute.routed) {
+        recordRoutingDecision(pinnedTurnRoute.complexity)
+        pinnedRouteProviderId = getActiveProviderProfile()?.id
+      }
+    } else if (
+      shouldDropPinForProviderSwap(
+        pinnedTurnRoute,
+        pinnedRouteProviderId,
+        getActiveProviderProfile()?.id,
+      )
+    ) {
+      // A provider-fallback swap happened mid-turn: the pinned model belongs to
+      // the previous provider. Drop the pin and let today's resolution (already
+      // re-derived to the new provider's model above) stand for the rest of the
+      // turn rather than sending a stale model id to the new endpoint.
+      pinnedTurnRoute = undefined
+    }
+    // Apply whatever pin survived the guard above (may be undefined after an
+    // invalidation, in which case currentModel keeps today's resolution).
+    if (pinnedTurnRoute?.routed) {
+      const priorModel = currentModel
+      currentModel = pinnedTurnRoute.model
+      toolUseContext.options.mainLoopModel = pinnedTurnRoute.model
+      // A model change at the turn boundary would replay a prior model's
+      // thinking signature; strip it under the provider gate (never for
+      // preserve-reasoning providers, which 400 on a stripped block).
+      if (pinnedTurnRoute.model !== priorModel) {
+        messagesForQuery = stripThinkingBlocksIfProviderAllows(
+          messagesForQuery as unknown as Parameters<typeof stripThinkingBlocksIfProviderAllows>[0],
+        ) as unknown as typeof messagesForQuery
+      }
+    }
+
     queryCheckpoint('query_setup_end')
 
     // Create fetch wrapper once per query session to avoid memory retention.
@@ -1127,6 +1206,13 @@ async function* queryLoop(
     const toolsForModel = agentStepLimit?.summaryRequested
       ? []
       : toolUseContext.options.tools
+    // Once-only guard for the smart-routing routed-error fallback (U4): a
+    // simple-routed call that errors retries once on the strong model; a second
+    // failure propagates normally rather than re-routing. Intentionally scoped
+    // per user turn (here, outside the while(attemptWithFallback) retry loop) —
+    // moving it inside would reset it every attempt and defeat the once-only
+    // guarantee.
+    let routedFallbackUsed = false
 
     queryCheckpoint('query_api_loop_start')
     try {
@@ -1459,6 +1545,64 @@ async function* queryLoop(
               'warning',
             )
 
+            continue
+          }
+          // Smart-routing routed-error fallback (U4): a simple-routed call that
+          // errors retries once on the strong model. Reuses this same
+          // attemptWithFallback retry loop — not a new retry mechanism. Aborts
+          // and 4xx client errors (auth/permission/bad-request) are NOT retried.
+          if (
+            pinnedTurnRoute?.routed &&
+            pinnedTurnRoute.complexity === 'simple' &&
+            !routedFallbackUsed &&
+            !(innerError instanceof FallbackTriggeredError) &&
+            !toolUseContext.abortController.signal.aborted &&
+            isRetryableRoutedModelError(innerError)
+          ) {
+            const strongModel = pinnedTurnRoute.strongModel
+            routedFallbackUsed = true
+            attemptWithFallback = true
+            recordRoutingEscalation()
+            // Re-pin to strong so this turn's later continuation passes (next_turn)
+            // don't re-route to the failing simple model and fall back again.
+            pinnedTurnRoute = {
+              routed: true,
+              model: strongModel,
+              complexity: 'strong',
+              reason: 'fell back from simple model',
+              strongModel,
+            }
+
+            yield* yieldMissingToolResultBlocks(
+              assistantMessages,
+              'Smart-routing fallback to strong model',
+            )
+            assistantMessages.length = 0
+            toolResults.length = 0
+            toolUseBlocks.length = 0
+            needsFollowUp = false
+
+            if (streamingToolExecutor) {
+              streamingToolExecutor.discard()
+              streamingToolExecutor = new StreamingToolExecutor(
+                toolUseContext.options.tools,
+                canUseTool,
+                toolUseContext,
+              )
+            }
+
+            currentModel = strongModel
+            toolUseContext.options.mainLoopModel = strongModel
+            // Strip prior-model thinking before retrying on the strong model,
+            // under the provider gate (never for preserve-reasoning providers).
+            messagesForQuery = stripThinkingBlocksIfProviderAllows(
+              messagesForQuery as unknown as Parameters<typeof stripThinkingBlocksIfProviderAllows>[0],
+            ) as unknown as typeof messagesForQuery
+
+            yield createSystemMessage(
+              `Smart routing: retrying on ${renderModelName(strongModel)} after the simple model failed`,
+              'warning',
+            )
             continue
           }
           throw innerError
